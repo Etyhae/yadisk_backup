@@ -12,11 +12,9 @@ CLI:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import random
-import re
 import sqlite3
 import sys
 import threading
@@ -25,6 +23,15 @@ import time
 import requests
 from dotenv import load_dotenv
 from tqdm import tqdm
+
+from unlim_common import (
+    BASE,
+    SessionExpired,
+    ensure_schema,
+    get_sk_uid,
+    make_session,
+    read_cookies,
+)
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -35,10 +42,6 @@ COOKIES_FILE = os.path.join(PROJECT, "cookies.json")
 DB_FILE = os.path.join(PROJECT, "unlim_state.db")
 LOG_FILE = os.path.join(PROJECT, "logs", "unlim.log")
 
-BASE = "https://disk.yandex.ru"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, encoding="utf-8",
                     format="%(asctime)s | %(levelname)s | %(message)s")
@@ -46,29 +49,6 @@ log = logging.getLogger("unlim")
 
 
 # ── DB ──────────────────────────────────────────────────────────────────────
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS unlim_files (
-    file_id TEXT PRIMARY KEY,
-    cluster_id TEXT,
-    name TEXT,
-    size INTEGER,
-    md5 TEXT,
-    mime TEXT,
-    status TEXT DEFAULT 'pending',
-    local_path TEXT,
-    error TEXT,
-    worker_id INTEGER,
-    assigned_at TIMESTAMP,
-    downloaded_at TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_unlim_status ON unlim_files(status);
-CREATE TABLE IF NOT EXISTS unlim_clusters (
-    cluster_id TEXT PRIMARY KEY,
-    size INTEGER,
-    fetched INTEGER DEFAULT 0
-);
-"""
 
 _tls = threading.local()
 
@@ -85,8 +65,8 @@ def db() -> sqlite3.Connection:
     return c
 
 
-def db_init():
-    db().executescript(SCHEMA)
+def db_init() -> None:
+    ensure_schema(db())
 
 
 # ── HTTP ────────────────────────────────────────────────────────────────────
@@ -96,36 +76,10 @@ def load_cookies() -> dict[str, str]:
     if not os.path.exists(COOKIES_FILE):
         sys.exit("Нет cookies.json — сначала экспортируй куки из браузера. "
                  "См. README раздел про куки.")
-    raw = json.loads(open(COOKIES_FILE, encoding="utf-8").read())
-    if not isinstance(raw, list):
-        sys.exit("cookies.json должен быть массивом (формат Cookie-Editor)")
-    return {c["name"]: c["value"] for c in raw
-            if c.get("name") and c.get("value") is not None}
-
-
-def make_session(cookies: dict[str, str]) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": UA, "Accept": "*/*",
-        "Accept-Language": "ru,en;q=0.9",
-        "Origin": BASE, "Referer": f"{BASE}/client/photo",
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/json",
-    })
-    for k, v in cookies.items():
-        s.cookies.set(k, v, domain=".yandex.ru")
-    return s
-
-
-def get_sk_uid(s: requests.Session) -> tuple[str, str]:
-    r = s.get(f"{BASE}/client/disk", timeout=30)
-    if "passport.yandex" in r.url or r.status_code != 200:
-        sys.exit("Куки невалидны — нужно обновить cookies.json")
-    sk = re.search(r'"sk"\s*:\s*"([^"]+)"', r.text)
-    uid = re.search(r'"uid"\s*:\s*"?(\d+)"?', r.text)
-    if not sk or not uid:
-        sys.exit("Не нашёл sk/uid в HTML — Яндекс изменил формат")
-    return sk.group(1), uid.group(1)
+    try:
+        return read_cookies(COOKIES_FILE)
+    except ValueError as e:
+        sys.exit(str(e))
 
 
 def make_cid(uid: str) -> str:
@@ -247,7 +201,10 @@ def cmd_collect():
     db_init()
     s = make_session(load_cookies())
     try:
-        sk, uid = get_sk_uid(s)
+        try:
+            sk, uid = get_sk_uid(s)
+        except (SessionExpired, RuntimeError) as e:
+            sys.exit(str(e))
         print(f"  ✓ uid={uid}, sk OK")
 
         psid = init_snapshot(s, sk, uid)

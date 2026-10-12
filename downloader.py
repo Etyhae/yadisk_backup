@@ -20,8 +20,9 @@ from typing import Callable, Iterator, Optional
 
 import yadisk
 from tenacity import (
+    RetryCallState,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -41,49 +42,36 @@ log = logging.getLogger("yadisk_backup")
 # Скип-листы для путей которые НИКОГДА не качаем
 SKIP_PATH_PREFIXES = ("disk:/Корзина", "disk:/Trash", "/Корзина", "/Trash")
 
-# Какие исключения yadisk считаем "повторяемыми"
-_RETRYABLE_EXC = (
-    yadisk.exceptions.RetriableYaDiskError
-    if hasattr(yadisk.exceptions, "RetriableYaDiskError")
-    else yadisk.exceptions.YaDiskError,
-)
-
-
 # ── retry-обёртка для сетевых вызовов ───────────────────────────────────────
+
+_NON_RETRYABLE = (
+    yadisk.exceptions.UnauthorizedError,
+    yadisk.exceptions.ForbiddenError,
+    yadisk.exceptions.PathNotFoundError,
+)
+_RATE_LIMIT_WAIT_SEC = 60.0
+_backoff = wait_exponential(multiplier=1, min=1, max=60)
 
 
 def _is_retryable(exc: BaseException) -> bool:
     """Решает, стоит ли retry-ить исключение."""
-    # Эти точно не имеет смысла повторять
-    non_retryable = (
-        yadisk.exceptions.UnauthorizedError,
-        yadisk.exceptions.ForbiddenError,
-        yadisk.exceptions.PathNotFoundError,
-    )
-    if isinstance(exc, non_retryable):
+    if isinstance(exc, _NON_RETRYABLE):
         return False
-    # 429 ловим отдельно — спим минуту
+    return isinstance(exc, (yadisk.exceptions.YaDiskError, OSError,
+                            ConnectionError, TimeoutError))
+
+
+def _wait_before_retry(retry_state: RetryCallState) -> float:
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
     if isinstance(exc, yadisk.exceptions.TooManyRequestsError):
-        log.warning("Поймали 429 TooManyRequests — спим 60 секунд")
-        time.sleep(60)
-        return True
-    if isinstance(exc, yadisk.exceptions.YaDiskError):
-        return True
-    if isinstance(exc, (OSError, ConnectionError, TimeoutError)):
-        return True
-    return False
+        log.warning("Поймали 429 TooManyRequests — спим %d секунд", _RATE_LIMIT_WAIT_SEC)
+        return _RATE_LIMIT_WAIT_SEC
+    return _backoff(retry_state)
 
 
 _retry = retry(
-    retry=retry_if_exception_type(
-        (
-            yadisk.exceptions.YaDiskError,
-            OSError,
-            ConnectionError,
-            TimeoutError,
-        )
-    ),
-    wait=wait_exponential(multiplier=1, min=1, max=60),
+    retry=retry_if_exception(_is_retryable),
+    wait=_wait_before_retry,
     stop=stop_after_attempt(5),
     reraise=True,
 )

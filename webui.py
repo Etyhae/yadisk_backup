@@ -24,7 +24,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from dotenv import load_dotenv, set_key
 from fastapi import FastAPI, HTTPException, Request
@@ -50,8 +50,15 @@ def get_config() -> dict:
     return {
         "token": (os.getenv("YA_DISK_TOKEN", "") or "").strip(),
         "download_dir": (os.getenv("DOWNLOAD_DIR", str(PROJECT / "downloads")) or "").strip(),
-        "max_workers": int(os.getenv("MAX_WORKERS", "4") or "4"),
+        "max_workers": _int_env("MAX_WORKERS", 4),
     }
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "") or default)
+    except ValueError:
+        return default
 
 
 def mask_token(token: str) -> str:
@@ -66,20 +73,28 @@ def mask_token(token: str) -> str:
 app = FastAPI(title="Yandex.Disk Backup UI")
 
 
-# ── CSRF защита: блокируем POST с чужих сайтов ─────────────────────────────
+# ── CSRF и DNS rebinding: пускаем только запросы к localhost ───────────────
 
-_ALLOWED_ORIGINS = ("http://localhost:8000", "http://127.0.0.1:8000")
+_ALLOWED_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]"}
+
+
+def _hostname(host: str) -> str:
+    if host.startswith("["):
+        return host.split("]", 1)[0] + "]"
+    return host.rsplit(":", 1)[0]
 
 
 @app.middleware("http")
-async def csrf_guard(request, call_next):
-    """Блокирует state-changing запросы с явно чужих сайтов (CSRF).
-    GET-запросы пропускаем всегда — они не меняют состояние.
+async def csrf_guard(request: Request, call_next):
+    """Host проверяем всегда (защита от DNS rebinding, иначе чужой сайт прочитает
+    /api/status). Для state-changing запросов Origin должен точно совпадать с Host.
     """
+    host = request.headers.get("host", "")
+    if _hostname(host) not in _ALLOWED_HOSTNAMES:
+        return JSONResponse({"detail": "Forbidden host"}, status_code=403)
     if request.method in ("POST", "PUT", "DELETE", "PATCH"):
-        origin = request.headers.get("origin") or ""
-        # Блокируем только если Origin явно с чужого сайта
-        if origin and not any(origin.startswith(a) for a in _ALLOWED_ORIGINS):
+        origin = request.headers.get("origin")
+        if origin is not None and origin != f"http://{host}":
             return JSONResponse({"detail": "Forbidden origin"}, status_code=403)
     return await call_next(request)
 
@@ -114,6 +129,10 @@ CATEGORY_LABELS = {
 }
 
 
+CATEGORY_SKIP_MARKER = "not in selected categories"
+UNLIM_NAME_EXPR = "COALESCE(NULLIF(name, ''), file_id)"
+
+
 def categorize(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
     for cat, exts in CATEGORIES.items():
@@ -126,9 +145,12 @@ def categorize(path: str) -> str:
 
 
 class Task:
-    def __init__(self, name: str, proc: subprocess.Popen):
+    def __init__(self, name: str, proc: subprocess.Popen, script: str, args: list[str]):
         self.name = name
         self.proc = proc
+        self.script = script
+        self.args = list(args)
+        self.stopped_by_user = False
         self.started_at = time.time()
         self.log: deque[str] = deque(maxlen=300)
         self._t = threading.Thread(target=self._read, daemon=True)
@@ -146,8 +168,9 @@ class Task:
     def alive(self) -> bool:
         return self.proc.poll() is None
 
-    def stop(self):
+    def stop(self) -> None:
         if self.alive():
+            self.stopped_by_user = True
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=5)
@@ -192,7 +215,7 @@ class TaskManager:
                 text=True, encoding="utf-8", errors="replace",
                 env=env,
             )
-            self._tasks[slot] = Task(slot, proc)
+            self._tasks[slot] = Task(slot, proc, script, args)
             return True, f"Запущено: {slot}"
 
     def stop(self, slot: str) -> tuple[bool, str]:
@@ -203,14 +226,27 @@ class TaskManager:
             t.stop()
             return True, f"Остановлено: {slot}"
 
-    def stop_all(self) -> int:
-        n = 0
+    def stop_prefix(self, prefix: str) -> list[str]:
+        stopped = []
         with self._lock:
-            for t in self._tasks.values():
-                if t.alive():
+            for slot, t in self._tasks.items():
+                if slot.startswith(prefix) and t.alive():
                     t.stop()
-                    n += 1
-        return n
+                    stopped.append(slot)
+        return stopped
+
+    def stop_all(self) -> list[str]:
+        return self.stop_prefix("")
+
+    def is_running(self, slot: str) -> bool:
+        with self._lock:
+            t = self._tasks.get(slot)
+            return t is not None and t.alive()
+
+    def any_running(self, prefix: str) -> bool:
+        with self._lock:
+            return any(slot.startswith(prefix) and t.alive()
+                       for slot, t in self._tasks.items())
 
     def status(self) -> dict:
         out = {}
@@ -220,6 +256,10 @@ class TaskManager:
                     "running": t.alive(),
                     "elapsed": time.time() - t.started_at,
                     "exit_code": t.proc.poll(),
+                    "stopped": t.stopped_by_user,
+                    "script": t.script,
+                    "command": t.args[0] if t.script == "main.py" and t.args else t.script,
+                    "args": t.args,
                     "log_tail": list(t.log)[-80:],
                 }
         return out
@@ -287,33 +327,42 @@ class Pipeline:
             return False, "Pipeline не идёт"
         self._stop = True
         # Гасим ТОЛЬКО задачи которые pipeline сам запустил
+        stopped_workers = []
         for slot in list(self._owned_slots):
-            tm.stop(slot)
+            ok, _ = tm.stop(slot)
+            if ok and slot.startswith("unlim_w"):
+                stopped_workers.append(slot)
+        release_unlim_workers(stopped_workers)
         self._log("⏹ остановлено пользователем")
         return True, "Остановлено"
 
-    def _wait_task(self, slot: str, on_finish_msg: str) -> int:
-        """Блокирующее ожидание завершения задачи в слоте."""
+    def _wait_task(self, slot: str) -> Optional[int]:
+        """Блокирующее ожидание завершения задачи в слоте. None если pipeline остановили."""
         while not self._stop:
             with tm._lock:
                 t = tm._tasks.get(slot)
-            if not t:
-                time.sleep(0.5); continue
-            if not t.alive():
-                code = t.proc.poll()
-                self._log(f"{on_finish_msg} (exit={code})")
-                return code if code is not None else 0
-            time.sleep(1.0)
-        return -1
+            if t and not t.alive():
+                return t.proc.poll()
+            time.sleep(0.5 if not t else 1.0)
+        return None
+
+    def _step(self, slot: str, script: str, args: list[str], title: str) -> Optional[int]:
+        ok, msg = self._own_start(slot, script, args)
+        if not ok:
+            self._log(f"❌ {title}: {msg}")
+            return -1
+        code = self._wait_task(slot)
+        if code is not None:
+            self._log(f"{'✓' if code == 0 else '⚠️'} {title}: exit={code}")
+        return code
 
     def _run(self):
+        warnings = 0
         try:
-            cfg = get_config()
-
             # Шаг 0: токен
             self.step = "проверка токена"
             self._log("🔑 Проверяю токен...")
-            tok = check_token(cfg["token"])
+            tok = check_token(get_config()["token"], force=True)
             if not tok.get("ok"):
                 self._log(f"❌ Токен невалиден: {tok.get('msg')}")
                 self.state = "failed"; return
@@ -321,25 +370,23 @@ class Pipeline:
 
             # === ДИСК ===
             if not self.skip_disk:
-                # scan
-                if self._stop: self._abort(); return
                 self.step = "сканирую диск"
                 self._log("🔍 Запускаю scan...")
-                ok, msg = self._own_start("disk", "main.py", ["scan"])
-                if not ok:
-                    self._log(f"❌ scan: {msg}"); self.state = "failed"; return
-                self._wait_task("disk", "✓ scan завершён")
-                if self._stop: self._abort(); return
+                code = self._step("disk", "main.py", ["scan"], "scan")
+                if code is None: self._abort(); return
+                if code != 0:
+                    self._log("❌ scan не удался, дальше не иду. Подробности на вкладке «Диск»")
+                    self.state = "failed"; return
 
-                # download
                 self.step = "качаю диск"
                 self._log(f"⬇️ Запускаю download (workers={self.workers})...")
-                ok, msg = self._own_start("disk", "main.py",
-                                          ["download", "--workers", str(self.workers), "--no-scan"])
-                if not ok:
-                    self._log(f"❌ download: {msg}"); self.state = "failed"; return
-                self._wait_task("disk", "✓ download диска завершён")
-                if self._stop: self._abort(); return
+                code = self._step("disk", "main.py",
+                                  ["download", "--workers", str(self.workers), "--no-scan"],
+                                  "download диска")
+                if code is None: self._abort(); return
+                if code != 0:
+                    warnings += 1
+                    self._log("⚠️ часть файлов диска не скачалась, их можно повторить на вкладке «Диск»")
             else:
                 self._log("⏭ Шаг 'диск' пропущен")
 
@@ -347,46 +394,44 @@ class Pipeline:
             if not self.skip_unlim:
                 cookies = check_cookies()
                 if not cookies.get("ok"):
+                    warnings += 1
                     self._log(f"⚠️ Cookies не загружены, пропускаю безлимит: {cookies.get('msg')}")
                 else:
-                    # collect
-                    if self._stop: self._abort(); return
                     self.step = "собираю список безлимита"
                     self._log("🗂 Запускаю unlim collect...")
-                    ok, msg = self._own_start("unlim_collect", "unlim_download.py", ["--collect"])
-                    if not ok:
-                        self._log(f"❌ unlim collect: {msg}"); self.state = "failed"; return
-                    self._wait_task("unlim_collect", "✓ список безлимита собран")
-                    if self._stop: self._abort(); return
+                    code = self._step("unlim_collect", "unlim_download.py", ["--collect"],
+                                      "сбор списка безлимита")
+                    if code is None: self._abort(); return
+                    if code != 0:
+                        self._log("❌ список безлимита не собран, проверь cookies")
+                        self.state = "failed"; return
 
-                    # workers
                     self.step = f"скачиваю безлимит ({self.workers} воркеров)"
                     self._log(f"🚀 Запускаю {self.workers} воркеров...")
+                    slots = []
                     for i in range(1, self.workers + 1):
                         ok, msg = self._own_start(f"unlim_w{i}", "unlim_worker.py", ["--id", str(i)])
                         if ok:
+                            slots.append(f"unlim_w{i}")
                             self._log(f"  ✓ воркер {i} запущен")
                         else:
                             self._log(f"  ✗ воркер {i}: {msg}")
 
-                    # Ждём пока все воркеры закончат
-                    while not self._stop:
-                        any_alive = False
-                        with tm._lock:
-                            for slot, t in tm._tasks.items():
-                                if slot.startswith("unlim_w") and t.alive():
-                                    any_alive = True
-                                    break
-                        if not any_alive:
-                            break
-                        time.sleep(2)
-                    self._log("✓ все воркеры безлимита завершили работу")
+                    codes = [self._wait_task(slot) for slot in slots]
+                    if self._stop or None in codes:
+                        self._abort(); return
+                    bad = [c for c in codes if c != 0]
+                    if bad:
+                        warnings += 1
+                        self._log(f"⚠️ воркеров с ошибкой: {len(bad)} (коды {bad})")
+                    else:
+                        self._log("✓ все воркеры безлимита завершили работу")
             else:
                 self._log("⏭ Шаг 'безлимит' пропущен")
 
             self.state = "done"
-            self.step = "финиш"
-            self._log("🏆 ВСЁ ГОТОВО!")
+            self.step = "финиш" if not warnings else "финиш с предупреждениями"
+            self._log("🏆 ВСЁ ГОТОВО!" if not warnings else "🏁 Готово, но есть предупреждения выше")
         except Exception as e:
             self._log(f"❌ Ошибка pipeline: {e}")
             self.state = "failed"
@@ -416,123 +461,120 @@ pipeline = Pipeline()
 
 
 def db_stats(db_file: Path, table: str = "files",
-             id_col: str = "remote_path") -> dict:
+             id_col: str = "remote_path", with_recent: bool = True) -> dict:
+    out = {"total": 0, "pending": 0, "downloaded": 0, "skipped": 0,
+           "failed": 0, "in_progress": 0,
+           "bytes_total": 0, "bytes_done": 0, "recent": []}
     if not db_file.exists():
-        return {"total": 0, "pending": 0, "downloaded": 0, "skipped": 0,
-                "failed": 0, "in_progress": 0,
-                "bytes_total": 0, "bytes_done": 0, "recent": []}
+        return out
     try:
         c = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=30)
         c.row_factory = sqlite3.Row
-        out = {"total": 0, "pending": 0, "downloaded": 0, "skipped": 0,
-               "failed": 0, "in_progress": 0,
-               "bytes_total": 0, "bytes_done": 0}
-        for r in c.execute(
-            f"SELECT status, COUNT(*) AS n, COALESCE(SUM(size),0) AS b "
-            f"FROM {table} GROUP BY status"
-        ):
-            st = r["status"]
-            if st not in out:
-                out[st] = 0
-            out[st] = r["n"]
-            out["total"] += r["n"]
-            out["bytes_total"] += r["b"]
-            if st in ("downloaded", "skipped"):
-                out["bytes_done"] += r["b"]
-        recent = list(c.execute(
-            f"SELECT {id_col} AS path, status, size FROM {table} "
-            f"WHERE downloaded_at IS NOT NULL "
-            f"ORDER BY downloaded_at DESC LIMIT 10"
-        ))
-        out["recent"] = [{"path": r["path"], "status": r["status"],
-                          "size": r["size"]} for r in recent]
-        c.close()
+        try:
+            for r in c.execute(
+                f"SELECT status, COUNT(*) AS n, COALESCE(SUM(size),0) AS b "
+                f"FROM {table} GROUP BY status"
+            ):
+                st = r["status"]
+                out[st] = r["n"]
+                out["total"] += r["n"]
+                out["bytes_total"] += r["b"]
+                if st in ("downloaded", "skipped"):
+                    out["bytes_done"] += r["b"]
+            if with_recent:
+                out["recent"] = [
+                    {"path": r["path"], "status": r["status"], "size": r["size"]}
+                    for r in c.execute(
+                        f"SELECT {id_col} AS path, status, size FROM {table} "
+                        f"WHERE downloaded_at IS NOT NULL "
+                        f"ORDER BY downloaded_at DESC LIMIT 10"
+                    )
+                ]
+        finally:
+            c.close()
         return out
     except sqlite3.Error as e:
-        return {"error": str(e)}
+        return {**out, "error": str(e)}
 
 
-# Кэш для тяжёлых операций (polling /api/status каждые 1.5 сек)
-_local_size_cache: dict[str, dict] = {}
-_LOCAL_SIZE_TTL = 10  # секунд
+_token_lock = threading.Lock()
+_token_check_cache: dict = {"token": None, "at": 0.0, "data": None, "refreshing": False}
+_TOKEN_TTL = 300
+_TOKEN_PENDING = {"ok": False, "pending": True, "msg": "проверяю…"}
 
 
-def local_size(path: str) -> dict:
-    r"""Размер папки. С TTL-кэшем 10 сек.
-    Защита от корня диска (C:\) — не обходим, иначе зависнет на десятках ГБ.
-    """
-    if not os.path.isdir(path):
-        return {"files": 0, "bytes": 0}
-
-    # Защита: если path это корень диска (C:\, D:\) — не считаем (займёт минуты)
-    abs_path = os.path.abspath(path)
-    if len(abs_path) <= 3 and abs_path.endswith(":\\"):
-        return {"files": 0, "bytes": 0, "skipped": "корень диска"}
-
-    cached = _local_size_cache.get(path)
-    now = time.time()
-    if cached and (now - cached["at"] < _LOCAL_SIZE_TTL):
-        return cached["data"]
-
-    n = 0; b = 0
-    deadline = now + 2.0  # макс 2 секунды на обход
-    try:
-        for dp, _, fns in os.walk(path):
-            if time.time() > deadline:
-                break
-            for fn in fns:
-                try:
-                    b += os.path.getsize(os.path.join(dp, fn))
-                    n += 1
-                except OSError:
-                    pass
-    except OSError:
-        pass
-
-    data = {"files": n, "bytes": b}
-    # Ограничиваем размер кэша — храним максимум 4 пути
-    if len(_local_size_cache) >= 4 and path not in _local_size_cache:
-        # удалить самый старый
-        oldest = min(_local_size_cache.items(), key=lambda x: x[1]["at"])[0]
-        _local_size_cache.pop(oldest, None)
-    _local_size_cache[path] = {"at": now, "data": data}
-    return data
-
-
-# Кэш для check_token: хранит только ОДИН токен (последний проверенный).
-# Так не накапливаются старые токены в памяти.
-_token_check_cache: dict = {"token": None, "at": 0, "data": None}
-_TOKEN_TTL = 30  # секунд
-
-
-def check_token(token: str) -> dict:
+def _token_placeholder(token: str) -> Optional[dict]:
     if not token or token.startswith("AQAAA_paste"):
         return {"ok": False, "msg": "Токен не задан"}
-    # Кэш — не дёргать Яндекс каждые 1.5 сек!
-    now = time.time()
-    if (_token_check_cache["token"] == token
-            and now - _token_check_cache["at"] < _TOKEN_TTL):
-        return _token_check_cache["data"]
+    return None
+
+
+def _fetch_token_info(token: str) -> dict:
     try:
         import yadisk
         cli = yadisk.Client(token=token)
-        if not cli.check_token():
+        try:
+            if not cli.check_token():
+                return {"ok": False, "msg": "Токен невалиден"}
+            info = cli.get_disk_info()
+        finally:
             cli.close()
-            return {"ok": False, "msg": "Токен невалиден"}
-        info = cli.get_disk_info()
-        used = getattr(info, "used_space", 0) or 0
-        total = getattr(info, "total_space", 0) or 0
-        photo_unlim = getattr(info, "photounlim_size", 0) or 0
-        login = getattr(info.user, "login", "?") if getattr(info, "user", None) else "?"
-        cli.close()
-        data = {"ok": True, "msg": "OK", "used": used, "total": total,
-                "photo_unlim": photo_unlim, "login": login}
-        _token_check_cache.update({"token": token, "at": now, "data": data})
-        return data
+        user = getattr(info, "user", None)
+        return {"ok": True, "msg": "OK",
+                "used": getattr(info, "used_space", 0) or 0,
+                "total": getattr(info, "total_space", 0) or 0,
+                "photo_unlim": getattr(info, "photounlim_size", 0) or 0,
+                "login": getattr(user, "login", "?") if user else "?"}
     except Exception as e:
-        data = {"ok": False, "msg": f"{type(e).__name__}: {e}"}
-        _token_check_cache.update({"token": token, "at": now, "data": data})
-        return data
+        return {"ok": False, "msg": f"{type(e).__name__}: {e}"}
+
+
+def check_token(token: str, force: bool = False) -> dict:
+    placeholder = _token_placeholder(token)
+    if placeholder:
+        return placeholder
+    with _token_lock:
+        cache = dict(_token_check_cache)
+    if (not force and cache["token"] == token and cache["data"]
+            and time.time() - cache["at"] < _TOKEN_TTL):
+        return cache["data"]
+    data = _fetch_token_info(token)
+    with _token_lock:
+        _token_check_cache.update({"token": token, "at": time.time(), "data": data})
+    return data
+
+
+def _refresh_token_in_background(token: str) -> None:
+    try:
+        data = _fetch_token_info(token)
+        with _token_lock:
+            if _token_check_cache["token"] == token:
+                _token_check_cache.update({"at": time.time(), "data": data})
+    finally:
+        with _token_lock:
+            _token_check_cache["refreshing"] = False
+
+
+def token_status(token: str) -> dict:
+    placeholder = _token_placeholder(token)
+    if placeholder:
+        return placeholder
+    with _token_lock:
+        cache = _token_check_cache
+        if cache["token"] != token:
+            cache.update({"token": token, "at": 0.0, "data": None})
+        fresh = cache["data"] is not None and time.time() - cache["at"] < _TOKEN_TTL
+        data = cache["data"]
+        if fresh or cache["refreshing"]:
+            return data or _TOKEN_PENDING
+        cache["refreshing"] = True
+    threading.Thread(target=_refresh_token_in_background, args=(token,), daemon=True).start()
+    return data or _TOKEN_PENDING
+
+
+def invalidate_token_cache() -> None:
+    with _token_lock:
+        _token_check_cache.update({"token": None, "at": 0.0, "data": None})
 
 
 def check_cookies() -> dict:
@@ -570,17 +612,15 @@ def index():
 def api_status():
     cfg = get_config()
     return {
-        "config": {**cfg, "token_masked": mask_token(cfg["token"])},
-        "token": check_token(cfg["token"]),
+        "config": {
+            "download_dir": cfg["download_dir"],
+            "max_workers": cfg["max_workers"],
+            "token_masked": mask_token(cfg["token"]),
+        },
+        "token": token_status(cfg["token"]),
         "cookies": check_cookies(),
-        "disk": {
-            "db": db_stats(DB_FILE, "files", "remote_path"),
-            "local": local_size(cfg["download_dir"]),
-        },
-        "unlim": {
-            "db": db_stats(UNLIM_DB_FILE, "unlim_files", "file_id"),
-            "local": local_size(os.path.join(cfg["download_dir"], "_unlim")),
-        },
+        "disk": {"db": db_stats(DB_FILE, "files", "remote_path")},
+        "unlim": {"db": db_stats(UNLIM_DB_FILE, "unlim_files", "file_id", with_recent=False)},
         "tasks": tm.status(),
         "pipeline": pipeline.status(),
     }
@@ -607,13 +647,33 @@ def api_start_stop():
 
 
 class TokenPayload(BaseModel):
-    token: str
+    token: str = Field(max_length=4096)
+
+
+def _has_control_chars(value: str) -> bool:
+    return any(ord(ch) < 32 for ch in value)
+
+
+def _write_env_key(key: str, value: str) -> None:
+    if not ENV_FILE.exists():
+        ENV_FILE.write_text("", encoding="utf-8")
+    set_key(str(ENV_FILE), key, value, quote_mode="never")
+    _restrict_permissions(ENV_FILE)
+    load_dotenv(ENV_FILE, override=True)
+
+
+def _restrict_permissions(path: Path) -> None:
+    if os.name == "posix":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
 
 @app.post("/api/config/token/check")
 def api_check_token(payload: TokenPayload):
     """Проверка без сохранения."""
-    return check_token((payload.token or "").strip())
+    return check_token((payload.token or "").strip(), force=True)
 
 
 @app.post("/api/config/token")
@@ -621,15 +681,19 @@ def api_set_token(payload: TokenPayload):
     token = (payload.token or "").strip()
     if not token:
         raise HTTPException(400, "Пустой токен")
-    if not ENV_FILE.exists():
-        ENV_FILE.write_text("", encoding="utf-8")
-    set_key(str(ENV_FILE), "YA_DISK_TOKEN", token, quote_mode="never")
-    load_dotenv(ENV_FILE, override=True)
-    return {"ok": True, "check": check_token(token)}
+    if _has_control_chars(token) or " " in token:
+        raise HTTPException(400, "Токен содержит пробелы или переносы строк")
+    _write_env_key("YA_DISK_TOKEN", token)
+    return {"ok": True, "check": check_token(token, force=True)}
 
 
 class DownloadDirPayload(BaseModel):
-    download_dir: str
+    download_dir: str = Field(max_length=1024)
+
+
+def _is_filesystem_root(path: str) -> bool:
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    return os.path.dirname(abs_path) == abs_path
 
 
 @app.post("/api/config/download_dir")
@@ -637,10 +701,13 @@ def api_set_dir(payload: DownloadDirPayload):
     d = (payload.download_dir or "").strip()
     if not d:
         raise HTTPException(400, "Пустой путь")
-    if not ENV_FILE.exists():
-        ENV_FILE.write_text("", encoding="utf-8")
-    set_key(str(ENV_FILE), "DOWNLOAD_DIR", d, quote_mode="never")
-    load_dotenv(ENV_FILE, override=True)
+    if _has_control_chars(d):
+        raise HTTPException(400, "Путь содержит недопустимые символы")
+    if _is_filesystem_root(d):
+        raise HTTPException(400, "Нельзя качать в корень диска, укажи подпапку, например D:/YandexBackup")
+    if os.path.exists(d) and not os.path.isdir(d):
+        raise HTTPException(400, "По этому пути лежит файл, а не папка")
+    _write_env_key("DOWNLOAD_DIR", d)
     return {"ok": True, "download_dir": d}
 
 
@@ -671,8 +738,12 @@ def api_check_cookies(payload: CookiesPayload):
 def api_set_cookies(payload: CookiesPayload):
     """Сохраняет cookies.json атомарно через tmp+replace."""
     arr = payload.cookies
+    check = _validate_cookies(arr)
+    if not check["ok"]:
+        return {"ok": False, "check": check, "msg": check["msg"]}
     tmp = COOKIES_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(arr, ensure_ascii=False, indent=2), encoding="utf-8")
+    _restrict_permissions(tmp)
     os.replace(tmp, COOKIES_FILE)
     return {"ok": True, "check": check_cookies(), "saved_count": len(arr)}
 
@@ -690,12 +761,12 @@ def api_clear_cookies():
 @app.post("/api/config/token/clear")
 def api_clear_token():
     if ENV_FILE.exists():
-        set_key(str(ENV_FILE), "YA_DISK_TOKEN", "", quote_mode="never")
-        load_dotenv(ENV_FILE, override=True)
+        _write_env_key("YA_DISK_TOKEN", "")
+    invalidate_token_cache()
     return {"ok": True}
 
 
-def preview_db(db_file: Path, table: str, id_col: str) -> dict:
+def preview_db(db_file: Path, table: str, name_expr: str) -> dict:
     """Группирует файлы в БД по категориям."""
     if not db_file.exists():
         return {"empty": True, "categories": {}}
@@ -706,24 +777,25 @@ def preview_db(db_file: Path, table: str, id_col: str) -> dict:
             for k in list(CATEGORY_LABELS.keys())
         }
         total = 0
-        for row in c.execute(
-            f"SELECT {id_col}, COALESCE(size, 0) FROM {table} "
-            f"WHERE status IN ('pending','downloaded','skipped','in_progress','failed')"
-        ):
-            cat = categorize(row[0])
-            summary[cat]["count"] += 1
-            summary[cat]["bytes"] += row[1]
-            total += 1
-        c.close()
+        try:
+            for name, size in c.execute(
+                f"SELECT {name_expr}, COALESCE(size, 0) FROM {table} "
+                f"WHERE status IN ('pending','downloaded','skipped','in_progress','failed')"
+            ):
+                cat = categorize(name or "")
+                summary[cat]["count"] += 1
+                summary[cat]["bytes"] += size
+                total += 1
+        finally:
+            c.close()
         return {"empty": total == 0, "total": total, "categories": summary}
     except sqlite3.Error as e:
         return {"empty": True, "error": str(e)}
 
 
-def filter_to_categories(db_file: Path, table: str, id_col: str,
-                          selected: list[str]) -> tuple[int, int]:
-    """Помечает файлы вне выбранных категорий как 'skipped' (одним проходом).
-    Уже скачанные/skipped/in_progress не трогаем.
+def filter_to_categories(db_file: Path, table: str, id_col: str, name_expr: str,
+                         selected: list[str]) -> tuple[int, int]:
+    """Помечает pending-файлы вне выбранных категорий как 'skipped' (одним проходом).
     Возвращает (skipped_count, kept_pending).
     """
     if not db_file.exists():
@@ -733,21 +805,15 @@ def filter_to_categories(db_file: Path, table: str, id_col: str,
     c.execute("PRAGMA journal_mode=WAL")
     try:
         rows = c.execute(
-            f"SELECT {id_col} FROM {table} WHERE status='pending'"
+            f"SELECT {id_col}, {name_expr} FROM {table} WHERE status='pending'"
         ).fetchall()
-        to_skip = []
-        kept = 0
-        for (path,) in rows:
-            if categorize(path) in sel:
-                kept += 1
-            else:
-                to_skip.append(path)
+        to_skip = [file_id for file_id, name in rows if categorize(name or "") not in sel]
         if to_skip:
             c.execute("BEGIN")
             try:
                 c.executemany(
                     f"UPDATE {table} SET status='skipped', "
-                    f"error='not in selected categories' WHERE {id_col}=?",
+                    f"error='{CATEGORY_SKIP_MARKER}' WHERE {id_col}=?",
                     [(p,) for p in to_skip],
                 )
                 c.execute("COMMIT")
@@ -755,13 +821,12 @@ def filter_to_categories(db_file: Path, table: str, id_col: str,
                 try: c.execute("ROLLBACK")
                 except sqlite3.Error: pass
                 raise
-        return (len(to_skip), kept)
+        return (len(to_skip), len(rows) - len(to_skip))
     finally:
         c.close()
 
 
-def unskip_category_marker(db_file: Path, table: str) -> int:
-    """Сбрасывает skipped-with-marker обратно в pending — на случай повторного выбора."""
+def _execute_write(db_file: Path, sql: str, params: tuple = ()) -> int:
     if not db_file.exists():
         return 0
     c = sqlite3.connect(db_file, timeout=30)
@@ -769,10 +834,7 @@ def unskip_category_marker(db_file: Path, table: str) -> int:
     try:
         c.execute("BEGIN")
         try:
-            n = c.execute(
-                f"UPDATE {table} SET status='pending', error=NULL "
-                f"WHERE status='skipped' AND error='not in selected categories'"
-            ).rowcount
+            n = c.execute(sql, params).rowcount
             c.execute("COMMIT")
             return n
         except Exception:
@@ -783,6 +845,64 @@ def unskip_category_marker(db_file: Path, table: str) -> int:
         c.close()
 
 
+def unskip_category_marker(db_file: Path, table: str) -> int:
+    """Сбрасывает skipped-with-marker обратно в pending — на случай повторного выбора."""
+    return _execute_write(
+        db_file,
+        f"UPDATE {table} SET status='pending', error=NULL "
+        f"WHERE status='skipped' AND error=?",
+        (CATEGORY_SKIP_MARKER,),
+    )
+
+
+def release_unlim_workers(slots: list[str]) -> int:
+    ids = [int(s.removeprefix("unlim_w")) for s in slots
+           if s.startswith("unlim_w") and s.removeprefix("unlim_w").isdigit()]
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    try:
+        return _execute_write(
+            UNLIM_DB_FILE,
+            f"UPDATE unlim_files SET status='pending', worker_id=NULL "
+            f"WHERE status='in_progress' AND worker_id IN ({marks})",
+            tuple(ids),
+        )
+    except sqlite3.Error:
+        return 0
+
+
+def reset_unlim_failed() -> int:
+    try:
+        return _execute_write(
+            UNLIM_DB_FILE,
+            "UPDATE unlim_files SET status='pending', error=NULL, attempts=0 "
+            "WHERE status='failed'",
+        )
+    except sqlite3.Error:
+        return _execute_write(
+            UNLIM_DB_FILE,
+            "UPDATE unlim_files SET status='pending', error=NULL WHERE status='failed'",
+        )
+
+
+def _start_unlim_workers(count: int) -> dict:
+    started = []
+    failed = []
+    for i in range(1, max(1, min(count, 6)) + 1):
+        ok, msg = tm.start(f"unlim_w{i}", "unlim_worker.py", ["--id", str(i)])
+        if ok:
+            started.append(i)
+        else:
+            failed.append({"id": i, "msg": msg})
+    msg = f"Запущено воркеров: {len(started)}" if started else "Воркеры не запущены"
+    return {"ok": bool(started), "msg": msg, "started": started, "failed": failed}
+
+
+_BUSY_DISK = {"ok": False, "msg": "Задача по диску уже идёт, дождись окончания или нажми «Стоп»"}
+_BUSY_UNLIM = {"ok": False, "msg": "Безлимит уже качается, дождись окончания или нажми «Стоп»"}
+
+
 @app.get("/api/disk/preview")
 def disk_preview():
     return preview_db(DB_FILE, "files", "remote_path")
@@ -790,7 +910,7 @@ def disk_preview():
 
 @app.get("/api/unlim/preview")
 def unlim_preview():
-    return preview_db(UNLIM_DB_FILE, "unlim_files", "file_id")
+    return preview_db(UNLIM_DB_FILE, "unlim_files", UNLIM_NAME_EXPR)
 
 
 class SelectivePayload(BaseModel):
@@ -800,32 +920,23 @@ class SelectivePayload(BaseModel):
 
 @app.post("/api/disk/download_selected")
 def disk_download_selected(payload: SelectivePayload):
-    # Сначала вернуть всё что было ранее помечено как "не выбрано" в pending
+    if tm.is_running("disk"):
+        return _BUSY_DISK
     unskip_category_marker(DB_FILE, "files")
-    # Потом отфильтровать заново
-    filter_to_categories(DB_FILE, "files", "remote_path", payload.categories)
-    # И запустить download
+    filter_to_categories(DB_FILE, "files", "remote_path", "remote_path", payload.categories)
     workers = max(1, min(payload.workers, 5))
-    ok, msg = tm.start("disk", "main.py",
-                       ["download", "--workers", str(workers), "--no-scan"])
-    return {"ok": ok, "msg": msg}
+    return _resp(tm.start("disk", "main.py",
+                          ["download", "--workers", str(workers), "--no-scan"]))
 
 
 @app.post("/api/unlim/download_selected")
 def unlim_download_selected(payload: SelectivePayload):
+    if tm.any_running("unlim"):
+        return _BUSY_UNLIM
     unskip_category_marker(UNLIM_DB_FILE, "unlim_files")
-    filter_to_categories(UNLIM_DB_FILE, "unlim_files", "file_id",
+    filter_to_categories(UNLIM_DB_FILE, "unlim_files", "file_id", UNLIM_NAME_EXPR,
                          payload.categories)
-    n = max(1, min(payload.workers, 6))
-    started = []
-    failed = []
-    for i in range(1, n + 1):
-        ok, msg = tm.start(f"unlim_w{i}", "unlim_worker.py", ["--id", str(i)])
-        if ok:
-            started.append(i)
-        else:
-            failed.append({"id": i, "msg": msg})
-    return {"ok": True, "started": started, "failed": failed}
+    return _start_unlim_workers(payload.workers)
 
 
 # Disk actions
@@ -859,15 +970,19 @@ def disk_stop():
     return _resp(tm.stop("disk"))
 
 
+def _remove_db(db_file: Path) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        f = db_file.with_name(db_file.name + suffix)
+        if f.exists():
+            f.unlink()
+
+
 @app.post("/api/disk/clear")
 def disk_clear():
     """Полная очистка БД сканирования диска + остановка задач."""
     tm.stop("disk")
     try:
-        for suffix in ("", "-wal", "-shm"):
-            f = DB_FILE.with_suffix(DB_FILE.suffix + suffix) if suffix else DB_FILE
-            if f.exists():
-                f.unlink()
+        _remove_db(DB_FILE)
         return {"ok": True, "msg": "БД диска очищена"}
     except OSError as e:
         return {"ok": False, "msg": str(e)}
@@ -876,15 +991,9 @@ def disk_clear():
 @app.post("/api/unlim/clear")
 def unlim_clear():
     """Полная очистка БД безлимита + остановка воркеров."""
-    with tm._lock:
-        for slot, t in list(tm._tasks.items()):
-            if slot.startswith("unlim") and t.alive():
-                t.stop()
+    tm.stop_prefix("unlim")
     try:
-        for suffix in ("", "-wal", "-shm"):
-            f = UNLIM_DB_FILE.with_suffix(UNLIM_DB_FILE.suffix + suffix) if suffix else UNLIM_DB_FILE
-            if f.exists():
-                f.unlink()
+        _remove_db(UNLIM_DB_FILE)
         return {"ok": True, "msg": "БД безлимита очищена"}
     except OSError as e:
         return {"ok": False, "msg": str(e)}
@@ -897,32 +1006,33 @@ def unlim_collect():
 
 
 class WorkersPayload(BaseModel):
-    workers: int = 4
+    workers: int = Field(default=4, ge=1, le=6)
 
 
 @app.post("/api/unlim/start_workers")
 def unlim_start_workers(payload: WorkersPayload):
-    n = max(1, min(payload.workers, 6))
-    started = []
-    failed = []
-    for i in range(1, n + 1):
-        ok, msg = tm.start(f"unlim_w{i}", "unlim_worker.py", ["--id", str(i)])
-        if ok:
-            started.append(i)
-        else:
-            failed.append({"id": i, "msg": msg})
-    return {"ok": True, "started": started, "failed": failed}
+    if tm.any_running("unlim_w"):
+        return _BUSY_UNLIM
+    return _start_unlim_workers(payload.workers)
+
+
+@app.post("/api/unlim/retry")
+def unlim_retry(payload: WorkersPayload):
+    if tm.any_running("unlim"):
+        return _BUSY_UNLIM
+    n = reset_unlim_failed()
+    if n == 0:
+        return {"ok": False, "msg": "Нет файлов с ошибками"}
+    result = _start_unlim_workers(payload.workers)
+    return {**result, "msg": f"Вернул в очередь: {n}. {result['msg']}"}
 
 
 @app.post("/api/unlim/stop")
 def unlim_stop():
-    n = 0
-    with tm._lock:
-        for slot, t in tm._tasks.items():
-            if slot.startswith("unlim") and t.alive():
-                t.stop()
-                n += 1
-    return {"ok": True, "stopped": n}
+    stopped = tm.stop_prefix("unlim")
+    released = release_unlim_workers(stopped)
+    return {"ok": bool(stopped), "stopped": len(stopped), "released": released,
+            "msg": f"Остановлено задач: {len(stopped)}" if stopped else "Нет активных задач"}
 
 
 # Organize / dedupe
@@ -977,8 +1087,9 @@ def organize_stop():
 
 @app.post("/api/stop_all")
 def stop_all():
-    n = tm.stop_all()
-    return {"ok": True, "stopped": n}
+    stopped = tm.stop_all()
+    release_unlim_workers(stopped)
+    return {"ok": True, "stopped": len(stopped)}
 
 
 @app.post("/api/task/{slot}/clear_log")

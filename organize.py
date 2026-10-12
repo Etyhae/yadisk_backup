@@ -57,7 +57,7 @@ DIR_OTHER = "Прочее"
 DIR_DUP = "_duplicates"
 
 SKIP_DIRS = {DIR_PHOTO, DIR_VIDEO, DIR_DOC, DIR_ARCHIVE, DIR_PROGRAM,
-             DIR_AUDIO, DIR_OTHER, DIR_DUP, ".sync"}
+             DIR_AUDIO, DIR_OTHER, DIR_DUP, ".sync", "_unlim_tmp_zips"}
 
 DATE_REGEXES = [
     re.compile(r"(20\d{2})[-_.](\d{2})[-_.](\d{2})"),

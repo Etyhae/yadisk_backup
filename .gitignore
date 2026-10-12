@@ -43,3 +43,6 @@ desktop.ini
 build/
 dist/
 *.egg-info/
+
+# Тесты
+.pytest_cache/

@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable, Iterator, Optional
 
 SCHEMA = """
@@ -24,7 +24,13 @@ CREATE TABLE IF NOT EXISTS files (
     downloaded_at TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_status ON files(status);
+CREATE INDEX IF NOT EXISTS idx_status_size ON files(status, size);
+CREATE INDEX IF NOT EXISTS idx_downloaded_at ON files(downloaded_at);
 """
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 class State:
@@ -110,7 +116,7 @@ class State:
                        downloaded_at = ?
                  WHERE remote_path = ?
                 """,
-                (local_path, datetime.utcnow().isoformat(timespec="seconds"), remote_path),
+                (local_path, _utc_now(), remote_path),
             )
 
     def mark_skipped(self, remote_path: str, local_path: str) -> None:
@@ -124,7 +130,7 @@ class State:
                        downloaded_at = ?
                  WHERE remote_path = ?
                 """,
-                (local_path, datetime.utcnow().isoformat(timespec="seconds"), remote_path),
+                (local_path, _utc_now(), remote_path),
             )
 
     def mark_failed(self, remote_path: str, error: str) -> None:

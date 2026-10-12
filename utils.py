@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
-from pathlib import Path
+import unicodedata
 
 # Символы, запрещённые в именах файлов на Windows
 _WIN_FORBIDDEN = '<>:"|?*'
@@ -17,6 +17,7 @@ _WIN_RESERVED = {
 }
 
 IS_WINDOWS = sys.platform.startswith("win")
+CASE_INSENSITIVE_FS = IS_WINDOWS or sys.platform == "darwin"
 # Порог, после которого включаем префикс \\?\ для длинных путей
 WIN_LONG_PATH_THRESHOLD = 240
 
@@ -82,36 +83,42 @@ def resolve_local_path(download_dir: str, remote_path: str) -> str:
 
 
 def avoid_case_collision(local_path: str) -> str:
-    """На Windows два файла foo.txt и FOO.txt — одно и то же.
-    Если файл с таким именем (без учёта регистра) уже занят другим путём — добавляем суффикс _1, _2 и т.д.
-    Учитываем только реально существующие файлы.
+    """На Windows и macOS foo.txt и FOO.txt — один и тот же файл.
+    Если по этому пути уже лежит файл с другим регистром имени (это другой
+    удалённый файл), добавляем суффикс _1, _2 и т.д. Свой файл с точным
+    совпадением имени оставляем как есть, чтобы resume работал.
     """
-    if not IS_WINDOWS:
+    if not CASE_INSENSITIVE_FS or not os.path.exists(to_long_path(local_path)):
         return local_path
-    if not os.path.exists(local_path):
-        # Проверим, не лежит ли в этой папке файл с тем же именем в другом регистре
-        parent = os.path.dirname(local_path)
-        name = os.path.basename(local_path)
-        if not parent or not os.path.isdir(parent):
-            return local_path
-        try:
-            existing = os.listdir(parent)
-        except OSError:
-            return local_path
-        existing_lower = {e.lower(): e for e in existing}
-        if name.lower() in existing_lower and existing_lower[name.lower()] != name:
-            return _suffix_path(local_path, existing_lower)
+    parent, name = os.path.split(local_path)
+    try:
+        existing = os.listdir(to_long_path(parent or "."))
+    except OSError:
         return local_path
-    return local_path
+    by_lower = {_fold(e): e for e in existing}
+    if _same_name(by_lower.get(_fold(name)), name):
+        return local_path
+    return _suffix_path(local_path, by_lower)
 
 
-def _suffix_path(local_path: str, existing_lower: dict[str, str]) -> str:
+def _fold(name: str) -> str:
+    return unicodedata.normalize("NFC", name).lower()
+
+
+def _same_name(actual: str | None, wanted: str) -> bool:
+    return actual is not None and (
+        unicodedata.normalize("NFC", actual) == unicodedata.normalize("NFC", wanted)
+    )
+
+
+def _suffix_path(local_path: str, by_lower: dict[str, str]) -> str:
     base, ext = os.path.splitext(local_path)
-    parent = os.path.dirname(local_path)
     i = 1
     while True:
         candidate = f"{base}_{i}{ext}"
-        if os.path.basename(candidate).lower() not in existing_lower:
+        cand_name = os.path.basename(candidate)
+        actual = by_lower.get(_fold(cand_name))
+        if actual is None or _same_name(actual, cand_name):
             return candidate
         i += 1
 
